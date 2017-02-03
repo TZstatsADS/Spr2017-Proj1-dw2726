@@ -44,7 +44,6 @@ library("RColorBrewer")
 library("RANN")
 library("topicmodels")
 
-# setwd('/Users/AaronWang/Desktop/5243-Spr2017-Proj1-dw2726')
 # source("./lib/plotstacked.R")
 source("../lib/speechFuncs.R")
 ```
