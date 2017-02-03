@@ -1,0 +1,331 @@
+---
+title: "5241_proj1"
+author: "Dejian Wang, dw2726"
+output: html_notebook
+---
+
+In this project we are interested in potentail TEMPORAL trend of inauguration speech from the presidents and discover how it alters along time.
+
+# Step 0: check and install needed packages. Load the libraries and functions. 
+
+```{r, message=FALSE, warning=FALSE}
+packages.used=c("rvest", "tibble", "qdap", 
+                "sentimentr", "gplots", "dplyr",
+                "tm", "syuzhet", "factoextra", 
+                "beeswarm", "scales", "RColorBrewer",
+                "RANN", "tm", "topicmodels")
+
+# check packages that need to be installed.
+packages.needed=setdiff(packages.used, 
+                        intersect(installed.packages()[,1], 
+                                  packages.used))
+# install additional packages
+if(length(packages.needed)>0){
+  install.packages(packages.needed, dependencies = TRUE)
+}
+
+# load packages
+library("plyr")
+library("xml2") # for rvest
+library("rvest")
+library("tibble")
+dyn.load('/Library/Java/JavaVirtualMachines/jdk1.8.0_101.jdk/Contents/Home/jre/lib/server/libjvm.dylib') # for qdap
+library("rJava") # for qdap
+library("qdap")
+library("sentimentr")
+library("gplots")
+library("dplyr")
+library("tm")
+library("syuzhet")
+library("factoextra")
+library("beeswarm")
+library("scales")
+library("RColorBrewer")
+library("RANN")
+library("topicmodels")
+
+# setwd('/Users/AaronWang/Desktop/5243-Spr2017-Proj1-dw2726')
+# source("./lib/plotstacked.R")
+source("../lib/speechFuncs.R")
+```
+
+This notebook was prepared with the following environmental settings.
+
+```{r}
+print(R.version)
+```
+
+# Step 1: Data scrapping: scrap speech URLs from <http://www.presidency.ucsb.edu/>, then scrap speeches texts from these URLs. 
+
+First scrap the URLs of all inaugural addresses of past presidents, and farewell addresses.
+
+```{r, message=FALSE, warning=FALSE}
+### Inauguaral speeches
+main.page <- read_html(x = "http://www.presidency.ucsb.edu/inaugurals.php") # Get link URLs. 
+inaug=f.speechlinks(main.page)
+inaug=inaug[-nrow(inaug),] # remove the last line, irrelevant due to error.
+
+#### Nomination speeches
+main.page=read_html("http://www.presidency.ucsb.edu/nomination.php")
+nomin <- f.speechlinks(main.page)
+
+#### Farewell speeches
+main.page=read_html("http://www.presidency.ucsb.edu/farewell_addresses.php")
+farewell <- f.speechlinks(main.page)
+```
+
+Using speech metadata posted on <http://www.presidency.ucsb.edu/>, we prepared CSV data sets for the speeches we will scrap. Then Assemble all metadata and URLs into one list.
+
+```{r}
+inaug.list=read.csv("../data/inauglist.csv", stringsAsFactors = FALSE)
+nomin.list=read.csv("../data/nominlist.csv", stringsAsFactors = FALSE)
+farewell.list=read.csv("../data/farewelllist.csv", stringsAsFactors = FALSE)
+
+inaug.list$Date = as.Date(inaug[,1], format="%B %e, %Y")
+farewell.list$Date = as.Date(farewell[,1], format="%B %e, %Y")
+speech.list=rbind(inaug.list, nomin.list, farewell.list)
+speech.list$type=c(rep("inaug", nrow(inaug.list)),
+                   rep("nomin", nrow(nomin.list)),
+                   rep("farewell", nrow(farewell.list)))
+speech.url=rbind(inaug, nomin, farewell)
+speech.list=cbind(speech.list, speech.url)
+```
+
+scrap the texts of speeches from the speech URLs: Based on the list of speeches, we scrap the main text part of the transcript's html page.
+
+```{r}
+# Loop over each row in speech.list
+speech.list$fulltext=NA
+for(i in seq(nrow(speech.list))) {
+  text <- read_html(speech.list$urls[i]) %>% # load the page
+    html_nodes(".displaytext") %>% # isolate the text
+    html_text() # get the text
+  speech.list$fulltext[i]=text
+}
+
+```
+
+Trump, as president-elect that has not been a politician, do not have a lot of formal speeches yet. For our textual analysis, we manually add several public transcripts from Trump:
++ [Transcript: Donald Trump's full immigration speech, annotated. LA Times, 08/31/2016] (http://www.latimes.com/politics/la-na-pol-donald-trump-immigration-speech-transcript-20160831-snap-htmlstory.html)
++ [Transcript of Donald Trump’s speech on national security in Philadelphia
+- The Hill, 09/07/16](http://thehill.com/blogs/pundits-blog/campaign/294817-transcript-of-donald-trumps-speech-on-national-security-in)
++ [Transcript of President-elect Trump's news conference
+CNBC, 01/11/2017](http://www.cnbc.com/2017/01/11/transcript-of-president-elect-donald-j-trumps-news-conference.html)
+
+```{r}
+speech1=paste(readLines("../data/fulltext/SpeechDonaldTrump-NA.txt", n=-1, skipNul=TRUE), collapse=" ")
+speech2=paste(readLines("../data/fulltext/SpeechDonaldTrump-NA2.txt", n=-1, skipNul=TRUE), collapse=" ")
+speech3=paste(readLines("../data/fulltext/PressDonaldTrump-NA.txt", n=-1, skipNul=TRUE), collapse=" ")
+
+Trump.speeches=data.frame(
+  President=rep("Donald J. Trump", 3),
+  File=rep("DonaldJTrump", 3),
+  Term=rep(0, 3),
+  Party=rep("Republican", 3),
+  Date = as.Date(c("August 31, 2016", "September 7, 2016", "January 11, 2017"), format="%B %e, %Y"),
+  Words=c(word_count(speech1), word_count(speech2), word_count(speech3)),
+  Win=rep("yes", 3),
+  type=rep("speeches", 3),
+  links=rep(NA, 3),
+  urls=rep(NA, 3),
+  fulltext=c(speech1, speech2, speech3)
+)
+
+speech.list=rbind(speech.list, Trump.speeches)
+```
+
+# Step 2: Data Processing --- generate list of sentences
+
+We will use sentences as units of analysis for this project. For each extracted sentence from the speech list, we perform three process tasks: assign an sequential id to each sentence in a speech (`sent.id`), calculate the number of words in each sentence as *sentence length* (`word.count`), and apply sentiment analysis using [NRC sentiment lexion](http://saifmohammad.com/WebPages/NRC-Emotion-Lexicon.htm).
+
+```{r, message=FALSE, warning=FALSE}
+sentence.list=NULL
+for(i in 1:nrow(speech.list)){
+  sentences=sent_detect(speech.list$fulltext[i],
+                        endmarks = c("?", ".", "!", "|", ";")) 
+  if(length(sentences)>0){
+    emotions=get_nrc_sentiment(sentences)
+    word.count=word_count(sentences)
+    # in case the word counts are zeros?
+    emotions=diag(1/(word.count+0.01))%*%as.matrix(emotions) # (Use the inverse length of each sentence as the weight )
+    sentence.list=rbind(sentence.list, 
+                        cbind(speech.list[i,-ncol(speech.list)],
+                              sentences=as.character(sentences), 
+                              word.count,
+                              emotions,
+                              sent.id=1:length(sentences)
+                              )
+    )
+  }
+}
+sentence.list = filter(sentence.list, !is.na(word.count))
+```
+
+# Step 3: Data Anlysis -- Word count.
+
+Compute and plot the average word count of sentence for each president. 
+
+```{r}
+.pardefault <- par(no.readonly = T)
+par(mar = c(3,3,2,2))
+sentence.list.inaug = filter(sentence.list, type == 'inaug')
+res = tapply(sentence.list.inaug$word.count, sentence.list.inaug$Date, mean)
+plot(as.Date(names(res)), unname(res), type = 'b')
+
+party_map = unique(sentence.list.inaug[,c('Date', 'Party')])
+f = function(date){ party_map[which(party_map$Date == date), 'Party'] }
+party_str = mapply(f, as.Date(names(res)))
+
+```
+
+We can see that as time went by, the average sentences' length tends to decrease. Thus the change of sentence length might reflect the change of general communication habits of the public along time. People tend to talk faster and more concise, and be less patient to speak or listen to long sentences.
+
+# Step 3: Data Anlysis -- Sentiment Analysis
+
+Calculate sentiment score for every sentence. Calculate the mean score for all sentences in every speech as variables. Perform kmeans clustering and visualization.
+
+```{r}
+# Compute the top emotion and its corresponding value of each sentences.
+sentence.list$topemotion=apply(select(sentence.list, anger:positive), 1, which.max)
+sentence.list$topemotion.v=apply(select(sentence.list, anger:positive), 1, max)
+
+feature_mean = function(df){ return (apply(df %>% select(c(anger:positive)), 2, mean, na.rm = T)) }
+emo.data = sentence.list %>% filter(type == 'inaug') %>% select(c(Date,anger:positive)) %>% ddply(.(Date), feature_mean)
+rownames(emo.data) = substr(emo.data$Date, 1, 4) # To track the temporal trend clearly, use Date as the label for each speech
+km.res=kmeans(select(emo.data, negative:positive), iter.max=200, 3, nstart = 59)
+
+fviz_cluster(km.res, 
+             stand=T, repel= TRUE, labelsize = 11,
+             data = select(emo.data, anger:positive),
+             show.clust.cent=FALSE)
+```
+
+From the clustering plot, the sentences emotions does NOT show interesting temporal trends. As a formal political style of speech delicately polished, inauguration speech straightly conveys positive emotions to the public without carrying much personal will. Thus it shouldn't carry complicated emotions or sentiment, and it's reasonable that we did not discern sentimental patterns along time. 
+
+# Step 3: Data Anlysis -- Topic modeling 
+
+Let's perform the topic modeling, the most fruitful part. First expand each sentence with its flanking sentences.
+
+```{r}
+corpus.list=sentence.list[2:(nrow(sentence.list)-1), ]
+sentence.pre=sentence.list$sentences[1:(nrow(sentence.list)-2)]
+sentence.post=sentence.list$sentences[3:(nrow(sentence.list)-1)]
+corpus.list$snipets=paste(sentence.pre, corpus.list$sentences, sentence.post, sep=" ") # paste 3 continuous sentences together
+rm.rows=(1:nrow(corpus.list))[corpus.list$sent.id==1]
+rm.rows=c(rm.rows, rm.rows-1)
+corpus.list=corpus.list[-rm.rows, ]
+```
+
+Text basic processing:
+
+```{r}
+docs <- Corpus(VectorSource(corpus.list$snipets))
+docs <-tm_map(docs,content_transformer(tolower)) # remove potentially problematic symbols
+docs <- tm_map(docs, removePunctuation) # remove punctuation
+docs <- tm_map(docs, removeNumbers) # Strip digits
+docs <- tm_map(docs, removeWords, stopwords("english")) # remove stopwords
+docs <- tm_map(docs, stripWhitespace) # remove whitespace
+docs <- tm_map(docs,stemDocument) # Stem document
+```
+
+Compute the DocumentTermMatrix.
+
+```{r}
+dtm <- DocumentTermMatrix(docs)
+#convert rownames to filenames#convert rownames to filenames
+rownames(dtm) <- paste(corpus.list$type, corpus.list$File,
+                       corpus.list$Term, corpus.list$sent.id, sep="_")
+
+rowTotals <- apply(dtm , 1, sum) #Find the sum of words in each Document
+
+dtm  <- dtm[rowTotals> 0, ]
+corpus.list=corpus.list[rowTotals>0, ]
+
+```
+
+Perform LDA model.
+
+```{r}
+#Set parameters for Gibbs sampling
+burnin <- 4000
+iter <- 2000
+thin <- 500
+seed <-list(2003,5,63,100001,765)
+nstart <- 5
+best <- TRUE
+
+#Number of topics
+k <- 15
+
+#Run LDA using Gibbs sampling
+# ldaOut <-LDA(dtm, k, method="Gibbs", control=list(nstart=nstart, 
+#                                                  seed = seed, best=best,
+#                                                  burnin = burnin, iter = iter, 
+#                                                  thin=thin))
+
+# saveRDS(ldaOut, "../output/lda_model.rds") # Save the LDA model
+# Load the LDA model:
+ldaOut <- readRDS(file = "../output/lda_model.rds")
+
+ldaOut.topics <- as.matrix(topics(ldaOut)) #docs to topics
+ldaOut.terms <- as.matrix(terms(ldaOut,20)) # top 10 terms in each topic
+topicProbabilities <- as.data.frame(ldaOut@gamma) # probabilities associated with each topic assignment
+```
+
+Based on the most popular terms and the most salient terms for each topic, we assign a hashtag to each topic. Calculate the mean score of all sentences for every inauguration speeches of every president. Perform kmeans and visualization.
+
+```{r, fig.width = 12, fig.height = 8}
+
+topics.hash = c("Misc1", "Economy", "American", "Patriotism", "Work&family", "Temporal", "Freedom&Equality", "Duty&Faith", "Government", "Ordeal", "Unity", "Legislation", "Defense", "Party&Election", "Misc2")
+corpus.list$ldatopic=as.vector(ldaOut.topics)
+corpus.list$ldahash=topics.hash[ldaOut.topics]
+colnames(topicProbabilities)=topics.hash
+corpus.list.df=cbind(corpus.list, topicProbabilities)
+select_topic_idx = c(1:15) + which("Misc1" == colnames(corpus.list.df)) - 1
+
+presid.summary=tbl_df(corpus.list.df)%>%
+  filter(type=="inaug")%>%
+  select(File, Date, select_topic_idx)%>%
+  group_by(File)%>%
+  summarise_each(funs(mean))
+
+party_map = unique(corpus.list.df[,c('File', 'Party')])
+f = function(file){ party_map[which(party_map$File == file), 'Party'] }
+party_str = mapply(f, presid.summary$File)
+
+# In order to easily clearify, use president's name + inauguration year + party he belongs as the label in the plot. 
+presid.summary=as.data.frame(presid.summary)
+rownames(presid.summary) = paste(presid.summary[,c(1,2)][[1]], substr(presid.summary[,c(1,2)][[2]], 1, 4), party_str)
+presid.summary = presid.summary[,-c(1,2)]
+km.res=kmeans(scale(presid.summary), iter.max=200,
+              4, nstart = 50)
+fviz_cluster(km.res, 
+             stand=T, repel= TRUE, labelsize = 9,
+             data = presid.summary,
+             show.clust.cent=FALSE)
+
+```
+
+From the clustering visualization plot, there is a recognizable temporal trend among dots: the presidents speeches with similar dates aggregate together. In general, the earlier date of the inauguration speech, the righter side it lies in the plot. 
+
+We would like to discover the most contributive topics under such temporal trend. First we think about checking the principle component of the data, which forms the two axes of the plot. 
+
+```{r}
+prcomp(scale(presid.summary))$rotation[,c('PC1','PC2')]
+```
+
+However, the components of PC1 are quite even thus not informative. We try another strategy: check the centers for four clusters, and search for the topic variables on which cluster 3 and cluster 4 have similar value. also, such value of the topic is significantly different from the value of cluster 1, while the value of cluster 2 is somewhere in between.
+
+```{r}
+km.res$centers
+```
+
+From the coords of the centers, topics "American", "Patriotism", "work&family", "Temporal" match the criteria mentioned above, considered the contributive topics under the temporal trend of the clustering plot. The meaning of these topics are: "American" conveys confidence to the bright future of Ameria; "Patriotism" gives names of the former US presidents, and showing admiration to the country; "work&family" are two basic component of everyone's life; "Temporal" is about "time". In the past hundreds of years, America had been steadily developing and becoming the strongest country in the world, bringing American people more pride and admiration with their home country, which accounts for the growing trend of "American" and "Patriotism"; After going through the domestic war, slavery-abolishment, the woman’s movement, steadily high economic growth, the cold war, the country became more stable and developed and the people became wealthier. Therefore, after large issues in the country's perspective settled, people will focus more on the basic components of their everyday life, such as their "work and family"; As time goes by, people have more chances to look backwards to the history, or think about their country and society in a "temporal" perspective. Therefore, it's accountable that the public focus of all these four topics will continuously gain as time went by, reflected in the inauguration speech.
+
+Next, we focus on each cluster along the timeline, and analyze the distinct topics underneath. Specifically, for each cluster, we want to pick the topics whose value in the cluster center are the largest among all four clusters, and show its reasonability by relating the topics with the unique society condiction at that period in the US. 
+We specifically focus on two clusters:
+
+The blue cluster (cluster 3) contains the "earliest" president (from late 18th century to late 19th century), with the distint topics "Unity", "Government", and "duty&faith". During this time, the country just built up and the government was still immature and evoling, and domestic war happened intermittently. Therefore, the "unity" of the country and the evolvement of "Government" should be the topics distinct within this period, with the "faith"" and ambition from the president of a young country. 
+
+The purple cluster (cluster 4) ranges in the second half of 19th century, while "Economy", "Legislation" and "Party & Election" is the most distinct topics. During this period, the booming of second industrial revolution flourished the economic growth dramatically . Also note that all presidents in this cluster are Republican, which is the newly formed party at that time. 
+
