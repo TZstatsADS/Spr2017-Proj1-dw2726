@@ -1,4 +1,4 @@
 # Project: 
 ### Doc folder
 
-The doc directory contains the report or presentation files. It can have subfolders.  
+ADS-proj1-dw2726.rmd is the r-notebook presentation for project 1.
